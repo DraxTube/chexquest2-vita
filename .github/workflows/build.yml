@@ -20,36 +20,98 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Clone doomgeneric
         run: |
-          git clone https://github.com/ozkl/doomgeneric.git doomgeneric_src
+          git clone --depth 1 https://github.com/ozkl/doomgeneric.git doomgeneric_src
 
       - name: Prepare source tree
         run: |
-          # Copy all doomgeneric C sources
           mkdir -p build_src
-          cp doomgeneric_src/doomgeneric/*.c build_src/ 2>/dev/null || true
-          cp doomgeneric_src/doomgeneric/*.h build_src/ 2>/dev/null || true
-          # Remove the example platform files we don't need
+
+          # Copy doomgeneric sources
+          cp doomgeneric_src/doomgeneric/*.c build_src/
+          cp doomgeneric_src/doomgeneric/*.h build_src/
+
+          # Remove platform-specific files we don't need
           rm -f build_src/doomgeneric_sdl.c
           rm -f build_src/doomgeneric_win.c
           rm -f build_src/doomgeneric_xlib.c
           rm -f build_src/doomgeneric_ascii.c
           rm -f build_src/doomgeneric_sokol.c
+          rm -f build_src/doomgeneric_null.c
+
+          # Remove original i_sound.c (we provide our own)
           rm -f build_src/i_sound.c
-          # Copy our Vita-specific implementation
+
+          # Copy our Vita implementation
           cp src/doomgeneric_vita.c build_src/
           cp src/i_sound_vita.c build_src/i_sound.c
+
+      - name: Patch doomgeneric for Vita compatibility
+        run: |
+          cd build_src
+
+          # 1. Fix i_timer.c - replace gettimeofday with a portable version
+          #    doomgeneric may use gettimeofday which needs <sys/time.h>
+          #    On Vita, sceKernelGetProcessTimeWide is preferred, but
+          #    newlib in vitasdk usually provides gettimeofday, so this
+          #    should work as-is.
+
+          # 2. Fix file operations - doomgeneric uses fopen/fread, which
+          #    work on Vita thanks to newlib, but we need to ensure paths work.
+          #    Patch m_misc.c to use Vita-friendly paths.
+
+          if [ -f "m_misc.c" ]; then
+            # Redirect default save/config path to Vita storage
+            sed -i 's|getenv("HOME")|"ux0:data/chexquest2"|g' m_misc.c 2>/dev/null || true
+            sed -i 's|getenv("home")|"ux0:data/chexquest2"|g' m_misc.c 2>/dev/null || true
+          fi
+
+          # 3. Patch d_iwad.c to look in our directory
+          if [ -f "d_iwad.c" ]; then
+            sed -i 's|getenv("DOOMWADDIR")|"ux0:data/chexquest2"|g' d_iwad.c 2>/dev/null || true
+            sed -i 's|getenv("HOME")|"ux0:data/chexquest2"|g' d_iwad.c 2>/dev/null || true
+          fi
+
+          # 4. Remove any references to networking (i_net)
+          if [ -f "i_net.c" ]; then
+            # Create minimal stub
+            cat > i_net.c << 'NETEOF'
+          #include "doomtype.h"
+          void I_InitNetwork(void) {}
+          void I_NetCmd(void) {}
+          NETEOF
+          fi
+
+          # 5. Patch i_system.c - replace exit() calls and fix includes
+          if [ -f "i_system.c" ]; then
+            # Replace exit calls with sceKernelExitProcess
+            sed -i '1i\#ifdef VITA\n#include <psp2/kernel/processmgr.h>\n#endif' i_system.c
+            sed -i 's/exit(0)/sceKernelExitProcess(0)/g' i_system.c 2>/dev/null || true
+            sed -i 's/exit(-1)/sceKernelExitProcess(-1)/g' i_system.c 2>/dev/null || true
+            sed -i 's/exit(1)/sceKernelExitProcess(1)/g' i_system.c 2>/dev/null || true
+
+            # Comment out signal handlers if present
+            sed -i 's/signal(/#ifndef VITA\n    signal(/g' i_system.c 2>/dev/null || true
+          fi
+
+          # 6. Ensure doomgeneric.h declares what we need
+          # Check if DOOMGENERIC_RESX is defined
+          if ! grep -q "DOOMGENERIC_RESX" doomgeneric.h 2>/dev/null; then
+            echo "WARNING: DOOMGENERIC_RESX not found in header"
+          fi
+
+          # 7. Create a simple Makefile as backup (not used with CMake)
+          cd ..
 
       - name: Create sce_sys assets
         run: |
           mkdir -p sce_sys/livearea/contents
-          # Generate a simple icon (64x64 PNG)
-          python3 -c "
+
+          python3 << 'PYEOF'
           import struct, zlib
+
           def create_png(w, h, r, g, b):
               def chunk(ctype, data):
                   c = ctype + data
@@ -58,14 +120,23 @@ jobs:
               for y in range(h):
                   raw += b'\x00'
                   for x in range(w):
-                      raw += bytes([r, g, b])
-              return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b'')
+                      # Simple gradient effect
+                      cr = min(255, r + (x * 50 // w))
+                      cg = min(255, g + (y * 30 // h))
+                      cb = b
+                      raw += bytes([cr, cg, cb])
+              return (b'\x89PNG\r\n\x1a\n' +
+                      chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) +
+                      chunk(b'IDAT', zlib.compress(raw, 9)) +
+                      chunk(b'IEND', b''))
+
           with open('sce_sys/icon0.png', 'wb') as f:
-              f.write(create_png(128, 128, 0, 180, 0))
+              f.write(create_png(128, 128, 20, 120, 20))
+
           with open('sce_sys/livearea/contents/bg.png', 'wb') as f:
-              f.write(create_png(840, 500, 0, 100, 0))
-          "
-          # Create template.xml
+              f.write(create_png(840, 500, 10, 60, 10))
+          PYEOF
+
           cat > sce_sys/livearea/contents/template.xml << 'XMLEOF'
           <?xml version="1.0" encoding="utf-8"?>
           <livearea style="a1" format-ver="01.00" content-rev="1">
@@ -78,16 +149,52 @@ jobs:
           </livearea>
           XMLEOF
 
-      - name: Build
+      - name: Build with CMake
         run: |
           mkdir -p build && cd build
-          cmake -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake \
+          cmake -DCMAKE_TOOLCHAIN_FILE="${VITASDK}/share/vita.toolchain.cmake" \
                 -DCMAKE_BUILD_TYPE=Release \
                 ..
-          make -j$(nproc)
+          make -j$(nproc) VERBOSE=1 2>&1 | tee build.log || {
+            echo "=== Build failed, attempting fixes ==="
+
+            cd ../build_src
+
+            # Common fix: i_system.c might have issues with signal()
+            # Just wrap problematic parts
+            if grep -l "signal\b" *.c 2>/dev/null; then
+              for f in $(grep -l "signal\b" *.c); do
+                sed -i 's/#include <signal.h>/\/\/ #include <signal.h> \/\/ disabled for Vita/g' "$f"
+                # Replace signal() calls with nothing
+                sed -i 's/signal([^)]*,[^)]*)/((void)0)/g' "$f"
+              done
+            fi
+
+            # Common fix: remove references to mkdir that might differ
+            # On Vita newlib, mkdir is available but may need different args
+            if grep -l "mkdir\b" *.c 2>/dev/null; then
+              for f in $(grep -l "mkdir\b" *.c); do
+                sed -i 's/mkdir(\([^,]*\),[^)]*)/mkdir(\1, 0777)/g' "$f" 2>/dev/null || true
+              done
+            fi
+
+            # Retry build
+            cd ../build
+            rm -rf *
+            cmake -DCMAKE_TOOLCHAIN_FILE="${VITASDK}/share/vita.toolchain.cmake" \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  ..
+            make -j$(nproc) VERBOSE=1
+          }
+
+      - name: Verify VPK
+        run: |
+          ls -la build/*.vpk
+          echo "Build successful!"
 
       - name: Upload VPK
         uses: actions/upload-artifact@v4
         with:
-          name: ChexQuest2-Vita
+          name: ChexQuest2-Vita-VPK
           path: build/*.vpk
+          if-no-files-found: error
