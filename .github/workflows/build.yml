@@ -33,13 +33,26 @@ jobs:
           cp doomgeneric_src/doomgeneric/*.c build_src/
           cp doomgeneric_src/doomgeneric/*.h build_src/
 
-          # Remove platform-specific files we don't need
+          # Remove ALL platform-specific backends - keep ONLY our vita one
           rm -f build_src/doomgeneric_sdl.c
           rm -f build_src/doomgeneric_win.c
           rm -f build_src/doomgeneric_xlib.c
           rm -f build_src/doomgeneric_ascii.c
           rm -f build_src/doomgeneric_sokol.c
           rm -f build_src/doomgeneric_null.c
+          rm -f build_src/doomgeneric_allegro.c
+          rm -f build_src/doomgeneric_emscripten.c
+
+          # Catch any future platform files we might miss
+          # Remove everything matching doomgeneric_*.c EXCEPT doomgeneric.c
+          cd build_src
+          for f in doomgeneric_*.c; do
+            case "$f" in
+              doomgeneric.c) ;; # keep the core file
+              *) rm -f "$f" ;;
+            esac
+          done
+          cd ..
 
           # Remove original i_sound.c (we provide our own)
           rm -f build_src/i_sound.c
@@ -48,35 +61,48 @@ jobs:
           cp src/doomgeneric_vita.c build_src/
           cp src/i_sound_vita.c build_src/i_sound.c
 
-      - name: Patch doomgeneric for Vita compatibility
+      - name: Fix main() conflict and Vita patches
         run: |
           cd build_src
 
-          # 1. Fix i_timer.c - replace gettimeofday with a portable version
-          #    doomgeneric may use gettimeofday which needs <sys/time.h>
-          #    On Vita, sceKernelGetProcessTimeWide is preferred, but
-          #    newlib in vitasdk usually provides gettimeofday, so this
-          #    should work as-is.
+          # Remove main() from doomgeneric.c - we provide our own in doomgeneric_vita.c
+          python3 << 'PYEOF'
+          import re
 
-          # 2. Fix file operations - doomgeneric uses fopen/fread, which
-          #    work on Vita thanks to newlib, but we need to ensure paths work.
-          #    Patch m_misc.c to use Vita-friendly paths.
+          with open("doomgeneric.c", "r") as f:
+              content = f.read()
 
-          if [ -f "m_misc.c" ]; then
-            # Redirect default save/config path to Vita storage
-            sed -i 's|getenv("HOME")|"ux0:data/chexquest2"|g' m_misc.c 2>/dev/null || true
-            sed -i 's|getenv("home")|"ux0:data/chexquest2"|g' m_misc.c 2>/dev/null || true
+          # Replace 'int main(' with 'int doomgeneric_original_main(' to avoid duplicate symbol
+          if 'int main(' in content:
+              content = content.replace('int main(', 'int doomgeneric_original_main(')
+
+          with open("doomgeneric.c", "w") as f:
+              f.write(content)
+          PYEOF
+
+          # Patch i_system.c - replace exit() with sceKernelExitProcess
+          if [ -f "i_system.c" ]; then
+            sed -i '1i\#ifdef VITA\n#include <psp2/kernel/processmgr.h>\n#define exit(x) sceKernelExitProcess(x)\n#endif' i_system.c
           fi
 
-          # 3. Patch d_iwad.c to look in our directory
+          # Patch d_iwad.c - redirect WAD search path
           if [ -f "d_iwad.c" ]; then
             sed -i 's|getenv("DOOMWADDIR")|"ux0:data/chexquest2"|g' d_iwad.c 2>/dev/null || true
             sed -i 's|getenv("HOME")|"ux0:data/chexquest2"|g' d_iwad.c 2>/dev/null || true
           fi
 
-          # 4. Remove any references to networking (i_net)
+          # Patch m_misc.c - redirect config/save path
+          if [ -f "m_misc.c" ]; then
+            sed -i 's|getenv("HOME")|"ux0:data/chexquest2"|g' m_misc.c 2>/dev/null || true
+          fi
+
+          # Ensure i_timer.c has sys/time.h
+          if [ -f "i_timer.c" ]; then
+            grep -q "sys/time.h" i_timer.c || sed -i '1i\#include <sys/time.h>' i_timer.c
+          fi
+
+          # Stub out i_net.c for Vita (no networking)
           if [ -f "i_net.c" ]; then
-            # Create minimal stub
             cat > i_net.c << 'NETEOF'
           #include "doomtype.h"
           void I_InitNetwork(void) {}
@@ -84,25 +110,6 @@ jobs:
           NETEOF
           fi
 
-          # 5. Patch i_system.c - replace exit() calls and fix includes
-          if [ -f "i_system.c" ]; then
-            # Replace exit calls with sceKernelExitProcess
-            sed -i '1i\#ifdef VITA\n#include <psp2/kernel/processmgr.h>\n#endif' i_system.c
-            sed -i 's/exit(0)/sceKernelExitProcess(0)/g' i_system.c 2>/dev/null || true
-            sed -i 's/exit(-1)/sceKernelExitProcess(-1)/g' i_system.c 2>/dev/null || true
-            sed -i 's/exit(1)/sceKernelExitProcess(1)/g' i_system.c 2>/dev/null || true
-
-            # Comment out signal handlers if present
-            sed -i 's/signal(/#ifndef VITA\n    signal(/g' i_system.c 2>/dev/null || true
-          fi
-
-          # 6. Ensure doomgeneric.h declares what we need
-          # Check if DOOMGENERIC_RESX is defined
-          if ! grep -q "DOOMGENERIC_RESX" doomgeneric.h 2>/dev/null; then
-            echo "WARNING: DOOMGENERIC_RESX not found in header"
-          fi
-
-          # 7. Create a simple Makefile as backup (not used with CMake)
           cd ..
 
       - name: Create sce_sys assets
@@ -120,7 +127,6 @@ jobs:
               for y in range(h):
                   raw += b'\x00'
                   for x in range(w):
-                      # Simple gradient effect
                       cr = min(255, r + (x * 50 // w))
                       cg = min(255, g + (y * 30 // h))
                       cb = b
@@ -149,43 +155,22 @@ jobs:
           </livearea>
           XMLEOF
 
+      - name: List build_src contents for debug
+        run: |
+          echo "=== Files in build_src ==="
+          ls -la build_src/doomgeneric*.c 2>/dev/null || echo "no doomgeneric_*.c files"
+          echo "=== All .c files ==="
+          ls build_src/*.c | head -60
+          echo "=== Total ==="
+          ls build_src/*.c | wc -l
+
       - name: Build with CMake
         run: |
           mkdir -p build && cd build
           cmake -DCMAKE_TOOLCHAIN_FILE="${VITASDK}/share/vita.toolchain.cmake" \
                 -DCMAKE_BUILD_TYPE=Release \
                 ..
-          make -j$(nproc) VERBOSE=1 2>&1 | tee build.log || {
-            echo "=== Build failed, attempting fixes ==="
-
-            cd ../build_src
-
-            # Common fix: i_system.c might have issues with signal()
-            # Just wrap problematic parts
-            if grep -l "signal\b" *.c 2>/dev/null; then
-              for f in $(grep -l "signal\b" *.c); do
-                sed -i 's/#include <signal.h>/\/\/ #include <signal.h> \/\/ disabled for Vita/g' "$f"
-                # Replace signal() calls with nothing
-                sed -i 's/signal([^)]*,[^)]*)/((void)0)/g' "$f"
-              done
-            fi
-
-            # Common fix: remove references to mkdir that might differ
-            # On Vita newlib, mkdir is available but may need different args
-            if grep -l "mkdir\b" *.c 2>/dev/null; then
-              for f in $(grep -l "mkdir\b" *.c); do
-                sed -i 's/mkdir(\([^,]*\),[^)]*)/mkdir(\1, 0777)/g' "$f" 2>/dev/null || true
-              done
-            fi
-
-            # Retry build
-            cd ../build
-            rm -rf *
-            cmake -DCMAKE_TOOLCHAIN_FILE="${VITASDK}/share/vita.toolchain.cmake" \
-                  -DCMAKE_BUILD_TYPE=Release \
-                  ..
-            make -j$(nproc) VERBOSE=1
-          }
+          make -j$(nproc) VERBOSE=1
 
       - name: Verify VPK
         run: |
