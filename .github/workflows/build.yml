@@ -1,0 +1,93 @@
+name: Build Chex Quest 2 PS Vita VPK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: vitasdk/vitasdk:latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apk add --no-cache git cmake make bash zip wget python3
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Clone doomgeneric
+        run: |
+          git clone https://github.com/ozkl/doomgeneric.git doomgeneric_src
+
+      - name: Prepare source tree
+        run: |
+          # Copy all doomgeneric C sources
+          mkdir -p build_src
+          cp doomgeneric_src/doomgeneric/*.c build_src/ 2>/dev/null || true
+          cp doomgeneric_src/doomgeneric/*.h build_src/ 2>/dev/null || true
+          # Remove the example platform files we don't need
+          rm -f build_src/doomgeneric_sdl.c
+          rm -f build_src/doomgeneric_win.c
+          rm -f build_src/doomgeneric_xlib.c
+          rm -f build_src/doomgeneric_ascii.c
+          rm -f build_src/doomgeneric_sokol.c
+          rm -f build_src/i_sound.c
+          # Copy our Vita-specific implementation
+          cp src/doomgeneric_vita.c build_src/
+          cp src/i_sound_vita.c build_src/i_sound.c
+
+      - name: Create sce_sys assets
+        run: |
+          mkdir -p sce_sys/livearea/contents
+          # Generate a simple icon (64x64 PNG)
+          python3 -c "
+          import struct, zlib
+          def create_png(w, h, r, g, b):
+              def chunk(ctype, data):
+                  c = ctype + data
+                  return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+              raw = b''
+              for y in range(h):
+                  raw += b'\x00'
+                  for x in range(w):
+                      raw += bytes([r, g, b])
+              return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b'')
+          with open('sce_sys/icon0.png', 'wb') as f:
+              f.write(create_png(128, 128, 0, 180, 0))
+          with open('sce_sys/livearea/contents/bg.png', 'wb') as f:
+              f.write(create_png(840, 500, 0, 100, 0))
+          "
+          # Create template.xml
+          cat > sce_sys/livearea/contents/template.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <livearea style="a1" format-ver="01.00" content-rev="1">
+            <livearea-bg>
+              <image>bg.png</image>
+            </livearea-bg>
+            <gate>
+              <startup-image>bg.png</startup-image>
+            </gate>
+          </livearea>
+          XMLEOF
+
+      - name: Build
+        run: |
+          mkdir -p build && cd build
+          cmake -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake \
+                -DCMAKE_BUILD_TYPE=Release \
+                ..
+          make -j$(nproc)
+
+      - name: Upload VPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChexQuest2-Vita
+          path: build/*.vpk
