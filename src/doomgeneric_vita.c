@@ -1,219 +1,194 @@
-/*
- * doomgeneric_vita.c - PS Vita platform implementation for doomgeneric
- *
- * Rendering: direct framebuffer via SceDisplay
- * Input: SceCtrl (gamepad) + analog sticks
- * Audio: disabled (stub)
- *
- * WAD file must be at: ux0:data/chexquest2/chex2.wad
- */
+// doomgeneric_vita.c - Chex Quest 2 for PS Vita
+// Implementazione completa di doomgeneric per PS Vita
 
-#include "doomgeneric.h"
-#include "doomkeys.h"
-#include "m_argv.h"
-
-#include <psp2/display.h>
-#include <psp2/ctrl.h>
-#include <psp2/touch.h>
-#include <psp2/power.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
-#include <psp2/kernel/sysmem.h>
+#include <psp2/ctrl.h>
+#include <psp2/touch.h>
+#include <psp2/display.h>
+#include <psp2/gxm.h>
+#include <psp2/types.h>
+#include <psp2/audioout.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/power.h>
+
+#include <vita2d.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 
-// PS Vita screen
+#include "doomgeneric.h"
+#include "doomkeys.h"
+#include "i_sound.h"
+#include "m_argv.h"
+#include "d_main.h"
+
+// Configurazione display
 #define VITA_SCREEN_W 960
 #define VITA_SCREEN_H 544
+#define DOOM_SCREEN_W DOOMGENERIC_RESX
+#define DOOM_SCREEN_H DOOMGENERIC_RESY
 
-// Use a static framebuffer - this is the simplest approach that always works
-// sceDisplaySetFrameBuf accepts any valid writable memory
-static uint32_t vita_fb[VITA_SCREEN_W * VITA_SCREEN_H] __attribute__((aligned(256)));
+// Configurazione audio
+#define AUDIO_SAMPLE_RATE 44100
+#define AUDIO_CHANNELS 2
+#define AUDIO_SAMPLES 1024
 
-static uint64_t start_time_us = 0;
+// Buffer dei tasti
+#define MAX_KEY_QUEUE 32
 
-// Key queue
-#define KEY_QUEUE_SIZE 64
-static struct {
-    unsigned short key;
+// Struttura per la coda dei tasti
+typedef struct {
+    unsigned char key;
     int pressed;
-} key_queue[KEY_QUEUE_SIZE];
-static int key_queue_head = 0;
-static int key_queue_tail = 0;
+} key_event_t;
 
-// Previous button state for edge detection
-static uint32_t prev_buttons = 0;
+static key_event_t key_queue[MAX_KEY_QUEUE];
+static int key_queue_read = 0;
+static int key_queue_write = 0;
 
-static void push_key(unsigned short key, int pressed) {
-    int next = (key_queue_head + 1) % KEY_QUEUE_SIZE;
-    if (next == key_queue_tail)
-        return; // queue full
-    key_queue[key_queue_head].key = key;
-    key_queue[key_queue_head].pressed = pressed;
-    key_queue_head = next;
+// Stato precedente dei controlli
+static SceCtrlData prev_ctrl;
+
+// Texture per il framebuffer
+static vita2d_texture *doom_texture = NULL;
+
+// Variabili audio
+static int audio_port = -1;
+static SceUID audio_thread_id = -1;
+static volatile bool audio_running = false;
+
+// Tick iniziale
+static uint64_t start_time = 0;
+
+// Mappatura controlli Vita -> DOOM
+typedef struct {
+    uint32_t vita_button;
+    unsigned char doom_key;
+} button_mapping_t;
+
+static const button_mapping_t button_map[] = {
+    { SCE_CTRL_UP,       KEY_UPARROW },
+    { SCE_CTRL_DOWN,     KEY_DOWNARROW },
+    { SCE_CTRL_LEFT,     KEY_LEFTARROW },
+    { SCE_CTRL_RIGHT,    KEY_RIGHTARROW },
+    { SCE_CTRL_CROSS,    KEY_USE },
+    { SCE_CTRL_CIRCLE,   KEY_FIRE },
+    { SCE_CTRL_SQUARE,   KEY_STRAFE_L },
+    { SCE_CTRL_TRIANGLE, KEY_STRAFE_R },
+    { SCE_CTRL_LTRIGGER, KEY_RSHIFT },  // Run
+    { SCE_CTRL_RTRIGGER, KEY_FIRE },
+    { SCE_CTRL_START,    KEY_ESCAPE },
+    { SCE_CTRL_SELECT,   KEY_TAB },     // Mappa
+    { 0, 0 }
+};
+
+// Mappatura armi numeriche
+static const unsigned char weapon_keys[] = {
+    '1', '2', '3', '4', '5', '6', '7'
+};
+static int current_weapon = 0;
+
+// ============================================================================
+// FUNZIONI DI UTILITÀ
+// ============================================================================
+
+static void add_key_event(unsigned char key, int pressed) {
+    key_queue[key_queue_write].key = key;
+    key_queue[key_queue_write].pressed = pressed;
+    key_queue_write = (key_queue_write + 1) % MAX_KEY_QUEUE;
 }
 
-static void check_button(uint32_t buttons, uint32_t prev, uint32_t mask, unsigned short doom_key) {
-    if ((buttons & mask) && !(prev & mask)) {
-        push_key(doom_key, 1);
-    } else if (!(buttons & mask) && (prev & mask)) {
-        push_key(doom_key, 0);
-    }
+static int get_key_event(unsigned char *key, int *pressed) {
+    if (key_queue_read == key_queue_write)
+        return 0;
+    
+    *key = key_queue[key_queue_read].key;
+    *pressed = key_queue[key_queue_read].pressed;
+    key_queue_read = (key_queue_read + 1) % MAX_KEY_QUEUE;
+    return 1;
 }
+
+// ============================================================================
+// IMPLEMENTAZIONE DOOMGENERIC
+// ============================================================================
 
 void DG_Init(void) {
-    // Set CPU/GPU clock to max for performance
+    // Inizializza sistema di potenza (CPU a piena velocità)
     scePowerSetArmClockFrequency(444);
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);
     scePowerSetGpuXbarClockFrequency(166);
-
-    // Initialize controller
+    
+    // Inizializza vita2d
+    vita2d_init();
+    vita2d_set_clear_color(RGBA8(0, 0, 0, 255));
+    
+    // Crea texture per DOOM
+    doom_texture = vita2d_create_empty_texture_format(
+        DOOM_SCREEN_W, 
+        DOOM_SCREEN_H,
+        SCE_GXM_TEXTURE_FORMAT_A8B8G8R8
+    );
+    
+    // Inizializza controlli
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
-
-    // Initialize touch (front)
+    memset(&prev_ctrl, 0, sizeof(prev_ctrl));
+    
+    // Inizializza touch (opzionale per menu)
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
-
-    // Clear framebuffer
-    memset(vita_fb, 0, sizeof(vita_fb));
-
-    // Set framebuffer for display
-    SceDisplayFrameBuf fb;
-    memset(&fb, 0, sizeof(fb));
-    fb.size = sizeof(fb);
-    fb.base = vita_fb;
-    fb.pitch = VITA_SCREEN_W;
-    fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
-    fb.width = VITA_SCREEN_W;
-    fb.height = VITA_SCREEN_H;
-    sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
-
-    // Record start time
-    start_time_us = sceKernelGetProcessTimeWide();
+    
+    // Salva tempo di avvio
+    start_time = sceKernelGetProcessTimeWide();
+    
+    printf("Chex Quest 2 Vita - Inizializzato!\n");
 }
 
 void DG_DrawFrame(void) {
-    if (!DG_ScreenBuffer)
+    if (!doom_texture || !DG_ScreenBuffer)
         return;
-
-    // Scale DOOMGENERIC_RESX x DOOMGENERIC_RESY -> VITA_SCREEN_W x VITA_SCREEN_H
-    // Nearest-neighbor scaling for speed
-
-    int src_w = DOOMGENERIC_RESX;
-    int src_h = DOOMGENERIC_RESY;
-    int dst_w = VITA_SCREEN_W;
-    int dst_h = VITA_SCREEN_H;
-
-    // Precompute X mapping table (once)
-    static int x_map[VITA_SCREEN_W];
-    static int x_map_computed = 0;
-    if (!x_map_computed) {
-        for (int dx = 0; dx < dst_w; dx++) {
-            x_map[dx] = (dx * src_w) / dst_w;
-        }
-        x_map_computed = 1;
-    }
-
-    for (int dy = 0; dy < dst_h; dy++) {
-        int sy = (dy * src_h) / dst_h;
-        uint32_t *src_row = &DG_ScreenBuffer[sy * src_w];
-        uint32_t *dst_row = &vita_fb[dy * dst_w];
-
-        for (int dx = 0; dx < dst_w; dx++) {
-            uint32_t pixel = src_row[x_map[dx]];
-            // doomgeneric outputs XRGB8888 (0x00RRGGBB)
-            // Vita SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 wants ABGR (0xAABBGGRR)
-            uint32_t r = (pixel >> 16) & 0xFF;
-            uint32_t g = (pixel >> 8) & 0xFF;
-            uint32_t b = pixel & 0xFF;
-            dst_row[dx] = 0xFF000000 | (b << 16) | (g << 8) | r;
+    
+    // Copia framebuffer DOOM nella texture
+    uint32_t *tex_data = (uint32_t *)vita2d_texture_get_datap(doom_texture);
+    uint32_t *src = (uint32_t *)DG_ScreenBuffer;
+    
+    int stride = vita2d_texture_get_stride(doom_texture) / 4;
+    
+    for (int y = 0; y < DOOM_SCREEN_H; y++) {
+        for (int x = 0; x < DOOM_SCREEN_W; x++) {
+            // Converti da BGRA a RGBA se necessario
+            uint32_t pixel = src[y * DOOM_SCREEN_W + x];
+            tex_data[y * stride + x] = pixel;
         }
     }
-
-    // Update display
-    SceDisplayFrameBuf fb;
-    memset(&fb, 0, sizeof(fb));
-    fb.size = sizeof(fb);
-    fb.base = vita_fb;
-    fb.pitch = VITA_SCREEN_W;
-    fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
-    fb.width = VITA_SCREEN_W;
-    fb.height = VITA_SCREEN_H;
-    sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
-
-    // --- Process input ---
-    SceCtrlData ctrl;
-    memset(&ctrl, 0, sizeof(ctrl));
-    sceCtrlPeekBufferPositive(0, &ctrl, 1);
-
-    uint32_t buttons = ctrl.buttons;
-
-    // Left analog stick -> movement (forward/back/strafe)
-    int lx = ctrl.lx - 128;
-    int ly = ctrl.ly - 128;
-
-    static int prev_up = 0, prev_down = 0, prev_left = 0, prev_right = 0;
-
-    int cur_up    = (ly < -40) ? 1 : 0;
-    int cur_down  = (ly >  40) ? 1 : 0;
-    int cur_left  = (lx < -40) ? 1 : 0;
-    int cur_right = (lx >  40) ? 1 : 0;
-
-    if (cur_up && !prev_up)       push_key(KEY_UPARROW, 1);
-    if (!cur_up && prev_up)       push_key(KEY_UPARROW, 0);
-    if (cur_down && !prev_down)   push_key(KEY_DOWNARROW, 1);
-    if (!cur_down && prev_down)   push_key(KEY_DOWNARROW, 0);
-    if (cur_left && !prev_left)   push_key(KEY_STRAFE_L, 1);
-    if (!cur_left && prev_left)   push_key(KEY_STRAFE_L, 0);
-    if (cur_right && !prev_right) push_key(KEY_STRAFE_R, 1);
-    if (!cur_right && prev_right) push_key(KEY_STRAFE_R, 0);
-
-    prev_up    = cur_up;
-    prev_down  = cur_down;
-    prev_left  = cur_left;
-    prev_right = cur_right;
-
-    // Right analog stick -> turning
-    int rx = ctrl.rx - 128;
-
-    static int prev_turn_left = 0, prev_turn_right = 0;
-    int cur_turn_left  = (rx < -40) ? 1 : 0;
-    int cur_turn_right = (rx >  40) ? 1 : 0;
-
-    if (cur_turn_left && !prev_turn_left)   push_key(KEY_LEFTARROW, 1);
-    if (!cur_turn_left && prev_turn_left)   push_key(KEY_LEFTARROW, 0);
-    if (cur_turn_right && !prev_turn_right) push_key(KEY_RIGHTARROW, 1);
-    if (!cur_turn_right && prev_turn_right) push_key(KEY_RIGHTARROW, 0);
-
-    prev_turn_left  = cur_turn_left;
-    prev_turn_right = cur_turn_right;
-
-    // D-Pad buttons
-    check_button(buttons, prev_buttons, SCE_CTRL_UP,       KEY_UPARROW);
-    check_button(buttons, prev_buttons, SCE_CTRL_DOWN,     KEY_DOWNARROW);
-    check_button(buttons, prev_buttons, SCE_CTRL_LEFT,     KEY_LEFTARROW);
-    check_button(buttons, prev_buttons, SCE_CTRL_RIGHT,    KEY_RIGHTARROW);
-
-    // Face buttons
-    check_button(buttons, prev_buttons, SCE_CTRL_CROSS,    KEY_USE);
-    check_button(buttons, prev_buttons, SCE_CTRL_CIRCLE,   KEY_ESCAPE);
-    check_button(buttons, prev_buttons, SCE_CTRL_SQUARE,   KEY_RSHIFT);
-    check_button(buttons, prev_buttons, SCE_CTRL_TRIANGLE, KEY_TAB);
-
-    // Triggers
-    check_button(buttons, prev_buttons, SCE_CTRL_RTRIGGER, KEY_FIRE);
-    check_button(buttons, prev_buttons, SCE_CTRL_LTRIGGER, KEY_STRAFE_L);
-
-    // Start / Select
-    check_button(buttons, prev_buttons, SCE_CTRL_START,    KEY_ENTER);
-    check_button(buttons, prev_buttons, SCE_CTRL_SELECT,   KEY_ESCAPE);
-
-    prev_buttons = buttons;
+    
+    // Calcola scaling per mantenere aspect ratio
+    float scale_x = (float)VITA_SCREEN_W / DOOM_SCREEN_W;
+    float scale_y = (float)VITA_SCREEN_H / DOOM_SCREEN_H;
+    float scale = (scale_x < scale_y) ? scale_x : scale_y;
+    
+    int draw_w = (int)(DOOM_SCREEN_W * scale);
+    int draw_h = (int)(DOOM_SCREEN_H * scale);
+    int draw_x = (VITA_SCREEN_W - draw_w) / 2;
+    int draw_y = (VITA_SCREEN_H - draw_h) / 2;
+    
+    // Rendering
+    vita2d_start_drawing();
+    vita2d_clear_screen();
+    
+    vita2d_draw_texture_scale(
+        doom_texture,
+        draw_x, draw_y,
+        scale, scale
+    );
+    
+    vita2d_end_drawing();
+    vita2d_swap_buffers();
+    vita2d_wait_rendering_done();
 }
 
 void DG_SleepMs(uint32_t ms) {
@@ -222,63 +197,162 @@ void DG_SleepMs(uint32_t ms) {
 
 uint32_t DG_GetTicksMs(void) {
     uint64_t now = sceKernelGetProcessTimeWide();
-    return (uint32_t)((now - start_time_us) / 1000);
+    return (uint32_t)((now - start_time) / 1000);
 }
 
-int DG_GetKey(int *pressed, unsigned char *doom_key) {
-    if (key_queue_tail == key_queue_head)
-        return 0;
-
-    *pressed = key_queue[key_queue_tail].pressed;
-    *doom_key = (unsigned char)key_queue[key_queue_tail].key;
-    key_queue_tail = (key_queue_tail + 1) % KEY_QUEUE_SIZE;
-    return 1;
+int DG_GetKey(int *pressed, unsigned char *key) {
+    // Leggi stato controlli
+    SceCtrlData ctrl;
+    sceCtrlPeekBufferPositive(0, &ctrl, 1);
+    
+    // Controlla cambiamenti nei pulsanti
+    for (int i = 0; button_map[i].vita_button != 0; i++) {
+        uint32_t btn = button_map[i].vita_button;
+        
+        // Pulsante appena premuto
+        if ((ctrl.buttons & btn) && !(prev_ctrl.buttons & btn)) {
+            add_key_event(button_map[i].doom_key, 1);
+        }
+        // Pulsante appena rilasciato
+        else if (!(ctrl.buttons & btn) && (prev_ctrl.buttons & btn)) {
+            add_key_event(button_map[i].doom_key, 0);
+        }
+    }
+    
+    // Analog stick sinistro per movimento
+    int lx = ctrl.lx - 128;
+    int ly = ctrl.ly - 128;
+    static int prev_lx = 0, prev_ly = 0;
+    
+    // Deadzone
+    if (abs(lx) < 30) lx = 0;
+    if (abs(ly) < 30) ly = 0;
+    
+    // Movimento avanti/indietro
+    if (ly < -50 && prev_ly >= -50)
+        add_key_event(KEY_UPARROW, 1);
+    else if (ly >= -50 && prev_ly < -50)
+        add_key_event(KEY_UPARROW, 0);
+    
+    if (ly > 50 && prev_ly <= 50)
+        add_key_event(KEY_DOWNARROW, 1);
+    else if (ly <= 50 && prev_ly > 50)
+        add_key_event(KEY_DOWNARROW, 0);
+    
+    // Rotazione
+    if (lx < -50 && prev_lx >= -50)
+        add_key_event(KEY_LEFTARROW, 1);
+    else if (lx >= -50 && prev_lx < -50)
+        add_key_event(KEY_LEFTARROW, 0);
+    
+    if (lx > 50 && prev_lx <= 50)
+        add_key_event(KEY_RIGHTARROW, 1);
+    else if (lx <= 50 && prev_lx > 50)
+        add_key_event(KEY_RIGHTARROW, 0);
+    
+    prev_lx = lx;
+    prev_ly = ly;
+    
+    // Analog stick destro per strafe/look
+    int rx = ctrl.rx - 128;
+    static int prev_rx = 0;
+    
+    if (abs(rx) < 30) rx = 0;
+    
+    if (rx < -50 && prev_rx >= -50)
+        add_key_event(KEY_STRAFE_L, 1);
+    else if (rx >= -50 && prev_rx < -50)
+        add_key_event(KEY_STRAFE_L, 0);
+    
+    if (rx > 50 && prev_rx <= 50)
+        add_key_event(KEY_STRAFE_R, 1);
+    else if (rx <= 50 && prev_rx > 50)
+        add_key_event(KEY_STRAFE_R, 0);
+    
+    prev_rx = rx;
+    
+    // Cambio arma con touch screen
+    SceTouchData touch;
+    sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
+    static int prev_touch = 0;
+    
+    if (touch.reportNum > 0 && prev_touch == 0) {
+        // Touch nella parte superiore dello schermo per cambiare arma
+        if (touch.report[0].y < 200) {
+            current_weapon = (current_weapon + 1) % 7;
+            add_key_event(weapon_keys[current_weapon], 1);
+            add_key_event(weapon_keys[current_weapon], 0);
+        }
+    }
+    prev_touch = touch.reportNum;
+    
+    // Salva stato precedente
+    prev_ctrl = ctrl;
+    
+    // Restituisci evento dalla coda
+    return get_key_event(key, pressed);
 }
 
 void DG_SetWindowTitle(const char *title) {
-    (void)title;
+    // Non applicabile su Vita
+    printf("Titolo: %s\n", title);
 }
 
+// ============================================================================
+// MAIN
+// ============================================================================
+
 int main(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-
-    // Create data directory
-    sceIoMkdir("ux0:data/chexquest2", 0777);
-
-    // Set up doom arguments
-    static char *vita_argv[] = {
-        "ChexQuest2Vita",
-        "-iwad",
-        "ux0:data/chexquest2/chex2.wad",
+    printf("=================================\n");
+    printf("  CHEX QUEST 2 - PS VITA PORT\n");
+    printf("  Powered by doomgeneric\n");
+    printf("=================================\n");
+    
+    // Argomenti per caricare Chex Quest 2
+    // Il WAD deve essere in ux0:data/chexquest2/
+    static char *doom_argv[] = {
+        "chexquest2",
+        "-iwad", "ux0:data/chexquest2/chex2.wad",
         NULL
     };
-    int vita_argc = 3;
-
-    // Try alternate WAD names if primary not found
+    int doom_argc = 3;
+    
+    // Controlla se il WAD esiste
     SceIoStat stat;
-    if (sceIoGetstat(vita_argv[2], &stat) < 0) {
-        const char *alternatives[] = {
-            "ux0:data/chexquest2/chex.wad",
-            "ux0:data/chexquest2/CHEX2.WAD",
-            "ux0:data/chexquest2/CHEX.WAD",
-            "ux0:data/chexquest2/doom.wad",
-            "ux0:data/chexquest2/DOOM.WAD",
-            NULL
-        };
-        for (int i = 0; alternatives[i]; i++) {
-            if (sceIoGetstat(alternatives[i], &stat) >= 0) {
-                vita_argv[2] = (char *)alternatives[i];
+    if (sceIoGetstat("ux0:data/chexquest2/chex2.wad", &stat) < 0) {
+        printf("ERRORE: WAD non trovato!\n");
+        printf("Copia chex2.wad in:\n");
+        printf("ux0:data/chexquest2/chex2.wad\n");
+        printf("\nPremi qualsiasi tasto per uscire...\n");
+        
+        SceCtrlData ctrl;
+        while (1) {
+            sceCtrlPeekBufferPositive(0, &ctrl, 1);
+            if (ctrl.buttons)
                 break;
-            }
+            sceKernelDelayThread(100000);
         }
+        
+        sceKernelExitProcess(0);
+        return 1;
     }
-
-    doomgeneric_Create(vita_argc, vita_argv);
-
+    
+    printf("WAD trovato! Avvio...\n");
+    
+    // Avvia DOOM/Chex Quest
+    doomgeneric_Create(doom_argc, doom_argv);
+    
+    // Loop principale
     while (1) {
         doomgeneric_Tick();
     }
-
+    
+    // Cleanup (non raggiunto normalmente)
+    if (doom_texture) {
+        vita2d_free_texture(doom_texture);
+    }
+    vita2d_fini();
+    sceKernelExitProcess(0);
+    
     return 0;
 }
