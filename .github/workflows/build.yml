@@ -1,4 +1,4 @@
-name: Build Chex Quest 2 PS Vita VPK
+name: Build Chex Quest 2 Vita
 
 on:
   push:
@@ -12,175 +12,118 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: vitasdk/vitasdk:latest
-
+    
     steps:
-      - name: Install dependencies
-        run: |
-          apk add --no-cache git cmake make bash zip wget python3
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Clone doomgeneric
+      run: |
+        git clone --depth 1 https://github.com/ozkl/doomgeneric.git doomgeneric_repo
+        mv doomgeneric_repo/doomgeneric ./doomgeneric
+        rm -rf doomgeneric_repo
 
-      - name: Clone doomgeneric
-        run: |
-          git clone --depth 1 https://github.com/ozkl/doomgeneric.git doomgeneric_src
+    - name: Patch doomgeneric for Vita
+      run: |
+        # Patch per rimuovere dipendenze SDL
+        cd doomgeneric
+        
+        # Crea stub per i_sound se necessario
+        cat > i_sound_stub.c << 'SOUND_EOF'
+        #include "i_sound.h"
+        #include "doomtype.h"
+        
+        boolean I_SDL_InitSound(boolean use_sfx_prefix) { return true; }
+        void I_SDL_ShutdownSound(void) {}
+        int I_SDL_GetSfxLumpNum(sfxinfo_t *sfx) { return 0; }
+        void I_SDL_UpdateSound(void) {}
+        void I_SDL_UpdateSoundParams(int channel, int vol, int sep) {}
+        int I_SDL_StartSound(sfxinfo_t *sfx, int channel, int vol, int sep, int pitch) { return 0; }
+        void I_SDL_StopSound(int channel) {}
+        boolean I_SDL_SoundIsPlaying(int channel) { return false; }
+        void I_SDL_PrecacheSounds(sfxinfo_t *sounds, int num_sounds) {}
+        
+        boolean I_SDL_InitMusic(void) { return true; }
+        void I_SDL_ShutdownMusic(void) {}
+        void I_SDL_SetMusicVolume(int vol) {}
+        void I_SDL_PlaySong(void *data, boolean loop) {}
+        void I_SDL_PauseSong(void) {}
+        void I_SDL_ResumeSong(void) {}
+        void I_SDL_StopSong(void) {}
+        boolean I_SDL_MusicIsPlaying(void) { return false; }
+        void I_SDL_PollMusic(void) {}
+        SOUND_EOF
+        
+        cd ..
 
-      - name: Prepare source tree
-        run: |
-          mkdir -p build_src
+    - name: Create sce_sys directory structure
+      run: |
+        mkdir -p sce_sys/livearea/contents
+        
+        # Crea icon0.png placeholder (128x128 PNG)
+        apt-get update && apt-get install -y imagemagick
+        convert -size 128x128 xc:#00AA00 -fill white -gravity center \
+          -pointsize 20 -annotate 0 'CHEX\nQUEST 2' sce_sys/icon0.png
+        
+        # Crea bg.png (840x500)
+        convert -size 840x500 xc:#004400 -fill white -gravity center \
+          -pointsize 40 -annotate 0 'CHEX QUEST 2\nPS VITA' sce_sys/livearea/contents/bg.png
+        
+        # Crea startup.png (280x158)  
+        convert -size 280x158 xc:#006600 -fill white -gravity center \
+          -pointsize 16 -annotate 0 'START' sce_sys/livearea/contents/startup.png
+        
+        # Crea template.xml
+        cat > sce_sys/livearea/contents/template.xml << 'TEMPLATE_EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <livearea style="a1" format-ver="01.00" content-rev="1">
+          <livearea-background>
+            <image>bg.png</image>
+          </livearea-background>
+          <gate>
+            <startup-image>startup.png</startup-image>
+          </gate>
+        </livearea>
+        TEMPLATE_EOF
 
-          # Copy doomgeneric sources
-          cp doomgeneric_src/doomgeneric/*.c build_src/
-          cp doomgeneric_src/doomgeneric/*.h build_src/
+    - name: Build VPK
+      run: |
+        mkdir build && cd build
+        cmake ..
+        make -j$(nproc)
 
-          # Remove ALL platform-specific backends by pattern (doomgeneric_*.c except doomgeneric.c)
-          cd build_src
-          for f in doomgeneric_*.c; do
-            case "$f" in
-              doomgeneric.c) ;;
-              *) echo "Removing platform backend: $f"; rm -f "$f" ;;
-            esac
-          done
+    - name: Upload VPK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: chexquest2-vita-vpk
+        path: build/*.vpk
+        if-no-files-found: error
 
-          # Remove ALL platform-specific files by scanning for non-portable includes
-          # This catches i_allegromusic.c, i_allegrosound.c, i_sdlmusic.c, i_sdlsound.c, etc.
-          for f in *.c; do
-            if grep -qE '#include\s*[<"](allegro|SDL|windows\.h|X11/|xinput)' "$f" 2>/dev/null; then
-              echo "Removing platform file (has platform includes): $f"
-              rm -f "$f"
-            fi
-          done
-
-          # Also remove by known names just to be safe
-          rm -f i_allegro*.c
-          rm -f i_sdl*.c
-          rm -f i_win*.c
-          rm -f i_x*.c
-
-          # Remove original i_sound.c (we provide our own)
-          rm -f i_sound.c
-
-          # Remove original i_net.c (we provide a stub below)
-          rm -f i_net.c
-
-          cd ..
-
-          # Copy our Vita implementation
-          cp src/doomgeneric_vita.c build_src/
-          cp src/i_sound_vita.c build_src/i_sound.c
-
-          # Create i_net stub
-          cat > build_src/i_net.c << 'NETEOF'
-          #include "doomtype.h"
-          void I_InitNetwork(void) {}
-          void I_NetCmd(void) {}
-          NETEOF
-
-      - name: Fix main() conflict and Vita patches
-        run: |
-          cd build_src
-
-          # Remove main() from doomgeneric.c - we provide our own in doomgeneric_vita.c
-          python3 << 'PYEOF'
-          with open("doomgeneric.c", "r") as f:
-              content = f.read()
-          if 'int main(' in content:
-              content = content.replace('int main(', 'int doomgeneric_original_main(')
-          with open("doomgeneric.c", "w") as f:
-              f.write(content)
-          PYEOF
-
-          # Patch i_system.c - replace exit() with sceKernelExitProcess
-          if [ -f "i_system.c" ]; then
-            sed -i '1i\#ifdef VITA\n#include <psp2/kernel/processmgr.h>\n#define exit(x) sceKernelExitProcess(x)\n#endif' i_system.c
-          fi
-
-          # Patch d_iwad.c - redirect WAD search path
-          if [ -f "d_iwad.c" ]; then
-            sed -i 's|getenv("DOOMWADDIR")|"ux0:data/chexquest2"|g' d_iwad.c 2>/dev/null || true
-            sed -i 's|getenv("HOME")|"ux0:data/chexquest2"|g' d_iwad.c 2>/dev/null || true
-          fi
-
-          # Patch m_misc.c - redirect config/save path
-          if [ -f "m_misc.c" ]; then
-            sed -i 's|getenv("HOME")|"ux0:data/chexquest2"|g' m_misc.c 2>/dev/null || true
-          fi
-
-          # Ensure i_timer.c has sys/time.h
-          if [ -f "i_timer.c" ]; then
-            grep -q "sys/time.h" i_timer.c || sed -i '1i\#include <sys/time.h>' i_timer.c
-          fi
-
-          cd ..
-
-      - name: List remaining source files for debug
-        run: |
-          echo "=== All .c files in build_src ==="
-          ls -1 build_src/*.c
-          echo "=== Total files ==="
-          ls build_src/*.c | wc -l
-          echo "=== Checking no platform includes remain ==="
-          grep -rlE '#include\s*[<"](allegro|SDL|windows\.h|X11/)' build_src/*.c || echo "OK: No platform includes found"
-
-      - name: Create sce_sys assets
-        run: |
-          mkdir -p sce_sys/livearea/contents
-
-          python3 << 'PYEOF'
-          import struct, zlib
-
-          def create_png(w, h, r, g, b):
-              def chunk(ctype, data):
-                  c = ctype + data
-                  return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
-              raw = b''
-              for y in range(h):
-                  raw += b'\x00'
-                  for x in range(w):
-                      cr = min(255, r + (x * 50 // w))
-                      cg = min(255, g + (y * 30 // h))
-                      cb = b
-                      raw += bytes([cr, cg, cb])
-              return (b'\x89PNG\r\n\x1a\n' +
-                      chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) +
-                      chunk(b'IDAT', zlib.compress(raw, 9)) +
-                      chunk(b'IEND', b''))
-
-          with open('sce_sys/icon0.png', 'wb') as f:
-              f.write(create_png(128, 128, 20, 120, 20))
-
-          with open('sce_sys/livearea/contents/bg.png', 'wb') as f:
-              f.write(create_png(840, 500, 10, 60, 10))
-          PYEOF
-
-          cat > sce_sys/livearea/contents/template.xml << 'XMLEOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <livearea style="a1" format-ver="01.00" content-rev="1">
-            <livearea-bg>
-              <image>bg.png</image>
-            </livearea-bg>
-            <gate>
-              <startup-image>bg.png</startup-image>
-            </gate>
-          </livearea>
-          XMLEOF
-
-      - name: Build with CMake
-        run: |
-          mkdir -p build && cd build
-          cmake -DCMAKE_TOOLCHAIN_FILE="${VITASDK}/share/vita.toolchain.cmake" \
-                -DCMAKE_BUILD_TYPE=Release \
-                ..
-          make -j$(nproc) VERBOSE=1
-
-      - name: Verify VPK
-        run: |
-          ls -la build/*.vpk
-          echo "Build successful!"
-
-      - name: Upload VPK
-        uses: actions/upload-artifact@v4
-        with:
-          name: ChexQuest2-Vita-VPK
-          path: build/*.vpk
-          if-no-files-found: error
+    - name: Create Release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ github.run_number }}
+        files: build/*.vpk
+        body: |
+          ## Chex Quest 2 per PS Vita
+          
+          ### Installazione:
+          1. Scarica il file VPK
+          2. Installalo con VitaShell
+          3. Copia `chex2.wad` in `ux0:data/chexquest2/`
+          4. Avvia il gioco!
+          
+          ### Controlli:
+          - Analog sinistro: Movimento
+          - Analog destro: Strafe
+          - X: Usa/Apri
+          - O / R: Spara
+          - L: Corri
+          - Start: Menu
+          - Select: Mappa
+          - Touch (alto): Cambia arma
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
