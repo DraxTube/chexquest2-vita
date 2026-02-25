@@ -33,33 +33,48 @@ jobs:
           cp doomgeneric_src/doomgeneric/*.c build_src/
           cp doomgeneric_src/doomgeneric/*.h build_src/
 
-          # Remove ALL platform-specific backends - keep ONLY our vita one
-          rm -f build_src/doomgeneric_sdl.c
-          rm -f build_src/doomgeneric_win.c
-          rm -f build_src/doomgeneric_xlib.c
-          rm -f build_src/doomgeneric_ascii.c
-          rm -f build_src/doomgeneric_sokol.c
-          rm -f build_src/doomgeneric_null.c
-          rm -f build_src/doomgeneric_allegro.c
-          rm -f build_src/doomgeneric_emscripten.c
-
-          # Catch any future platform files we might miss
-          # Remove everything matching doomgeneric_*.c EXCEPT doomgeneric.c
+          # Remove ALL platform-specific backends by pattern (doomgeneric_*.c except doomgeneric.c)
           cd build_src
           for f in doomgeneric_*.c; do
             case "$f" in
-              doomgeneric.c) ;; # keep the core file
-              *) rm -f "$f" ;;
+              doomgeneric.c) ;;
+              *) echo "Removing platform backend: $f"; rm -f "$f" ;;
             esac
           done
-          cd ..
+
+          # Remove ALL platform-specific files by scanning for non-portable includes
+          # This catches i_allegromusic.c, i_allegrosound.c, i_sdlmusic.c, i_sdlsound.c, etc.
+          for f in *.c; do
+            if grep -qE '#include\s*[<"](allegro|SDL|windows\.h|X11/|xinput)' "$f" 2>/dev/null; then
+              echo "Removing platform file (has platform includes): $f"
+              rm -f "$f"
+            fi
+          done
+
+          # Also remove by known names just to be safe
+          rm -f i_allegro*.c
+          rm -f i_sdl*.c
+          rm -f i_win*.c
+          rm -f i_x*.c
 
           # Remove original i_sound.c (we provide our own)
-          rm -f build_src/i_sound.c
+          rm -f i_sound.c
+
+          # Remove original i_net.c (we provide a stub below)
+          rm -f i_net.c
+
+          cd ..
 
           # Copy our Vita implementation
           cp src/doomgeneric_vita.c build_src/
           cp src/i_sound_vita.c build_src/i_sound.c
+
+          # Create i_net stub
+          cat > build_src/i_net.c << 'NETEOF'
+          #include "doomtype.h"
+          void I_InitNetwork(void) {}
+          void I_NetCmd(void) {}
+          NETEOF
 
       - name: Fix main() conflict and Vita patches
         run: |
@@ -67,15 +82,10 @@ jobs:
 
           # Remove main() from doomgeneric.c - we provide our own in doomgeneric_vita.c
           python3 << 'PYEOF'
-          import re
-
           with open("doomgeneric.c", "r") as f:
               content = f.read()
-
-          # Replace 'int main(' with 'int doomgeneric_original_main(' to avoid duplicate symbol
           if 'int main(' in content:
               content = content.replace('int main(', 'int doomgeneric_original_main(')
-
           with open("doomgeneric.c", "w") as f:
               f.write(content)
           PYEOF
@@ -101,16 +111,16 @@ jobs:
             grep -q "sys/time.h" i_timer.c || sed -i '1i\#include <sys/time.h>' i_timer.c
           fi
 
-          # Stub out i_net.c for Vita (no networking)
-          if [ -f "i_net.c" ]; then
-            cat > i_net.c << 'NETEOF'
-          #include "doomtype.h"
-          void I_InitNetwork(void) {}
-          void I_NetCmd(void) {}
-          NETEOF
-          fi
-
           cd ..
+
+      - name: List remaining source files for debug
+        run: |
+          echo "=== All .c files in build_src ==="
+          ls -1 build_src/*.c
+          echo "=== Total files ==="
+          ls build_src/*.c | wc -l
+          echo "=== Checking no platform includes remain ==="
+          grep -rlE '#include\s*[<"](allegro|SDL|windows\.h|X11/)' build_src/*.c || echo "OK: No platform includes found"
 
       - name: Create sce_sys assets
         run: |
@@ -154,15 +164,6 @@ jobs:
             </gate>
           </livearea>
           XMLEOF
-
-      - name: List build_src contents for debug
-        run: |
-          echo "=== Files in build_src ==="
-          ls -la build_src/doomgeneric*.c 2>/dev/null || echo "no doomgeneric_*.c files"
-          echo "=== All .c files ==="
-          ls build_src/*.c | head -60
-          echo "=== Total ==="
-          ls build_src/*.c | wc -l
 
       - name: Build with CMake
         run: |
