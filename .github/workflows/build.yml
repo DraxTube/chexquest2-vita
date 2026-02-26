@@ -1,47 +1,49 @@
-name: Build PS Vita VPK
+name: Build Chex Quest 2 Vita
 
-on:
-  push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
+on: [push, pull_request]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: vitasdk/vitasdk:latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      - uses: actions/checkout@v4
 
-    # 1. Ripristina il PATH del compilatore VitaSDK
-    - name: Setup VitaSDK PATH
-      run: echo "$VITASDK/bin" >> $GITHUB_PATH
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git cmake make build-essential
 
-    # 2. Installa ImageMagick per generare l'icona del VPK
-    - name: Install dependencies
-      run: apk add --no-cache imagemagick
+      - name: Install VitaSDK
+        run: |
+          export VITASDK=/usr/local/vitasdk
+          export PATH="$VITASDK/bin:$PATH"
+          git clone https://github.com/vitasdk/vdpm
+          cd vdpm
+          ./bootstrap-vitasdk.sh
+          echo "VITASDK=$VITASDK" >> $GITHUB_ENV
+          echo "$VITASDK/bin" >> $GITHUB_PATH
 
-    # 3. Configura il progetto CMake
-    - name: Configure CMake
-      run: |
-        mkdir build
-        cd build
-        cmake -DCMAKE_TOOLCHAIN_FILE=${VITASDK}/share/vita.cmake ..
+      - name: Install Vita libraries
+        run: |
+          vdpm vita2d
+          vdpm libpng
+          vdpm libjpeg-turbo
+          vdpm zlib
 
-    # 4. Compila il VPK
-    - name: Build VPK
-      run: |
-        cd build
-        make -j4
+      - name: Verify toolchain
+        run: |
+          which arm-vita-eabi-gcc
+          arm-vita-eabi-gcc --version
 
-    # 5. Carica il file VPK compilato negli Artifacts
-    - name: Upload VPK Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ChexQuest2-Vita
-        path: build/ChexQuest2.vpk
+      - name: Build
+        run: |
+          mkdir build && cd build
+          cmake ..
+          make -j$(nproc)
+
+      - name: Upload VPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChexQuest2-VPK
+          path: build/ChexQuest2.vpk
