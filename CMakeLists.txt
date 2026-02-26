@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.21)
-set(CMAKE_TOOLCHAIN_FILE $ENV{VITASDK}/share/vita.cmake)
+# Detect VITASDK if not set
+if(NOT DEFINED ENV{VITASDK})
+    if(EXISTS /usr/local/vitasdk)
+        set(ENV{VITASDK} /usr/local/vitasdk)
+    elseif(EXISTS $ENV{HOME}/vitasdk)
+        set(ENV{VITASDK} $ENV{HOME}/vitasdk)
+    endif()
+endif()
+# Load Vita toolchain BEFORE project()
+include($ENV{VITASDK}/share/vita.cmake)
 project(ChexQuest2Vita)
 include(FetchContent)
 FetchContent_Declare(
