@@ -1,36 +1,42 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.10)
+project(ChexQuest2Vita)
 
-if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
-  if(DEFINED ENV{VITASDK})
-    set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "toolchain file")
-  else()
-    message(FATAL_ERROR "Please define VITASDK to point to your SDK path!")
-  endif()
-endif()
+# Opzioni di ottimizzazione
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -ffast-math")
+add_definitions(-DDOOMGENERIC -D__VITA__)
 
-project(chexquest2-vita C)
-include("${VITASDK}/share/vita.cmake" REQUIRED)
+# Raccoglie tutti i sorgenti originali di doomgeneric
+file(GLOB DOOM_SRCS "doomgeneric/doom/*.c")
 
-set(VITA_APP_NAME "Chex Quest 2")
-set(VITA_TITLEID  "CHEX00002")
-set(VITA_VERSION  "01.00")
+# Rimuove eventuali file main() di altre piattaforme dentro doomgeneric se presenti
+list(REMOVE_ITEM DOOM_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/doomgeneric/doom/i_main.c")
+list(REMOVE_ITEM DOOM_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/doomgeneric/doom/doomgeneric_sdl.c")
+list(REMOVE_ITEM DOOM_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/doomgeneric/doom/doomgeneric_win.c")
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -Wall -ffast-math")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall -ffast-math")
+# Aggiunge il nostro sorgente PS Vita e i file di Doom
+add_executable(chexquest2_vita doomgeneric_vita.c ${DOOM_SRCS})
 
-# Definizioni necessarie per doomgeneric
-add_definitions(-DDOOMGENERIC_RESX=320)
-add_definitions(-DDOOMGENERIC_RESY=200)
-add_definitions(-DFEATURE_SOUND)
+target_include_directories(chexquest2_vita PRIVATE doomgeneric/doom)
 
-# Source files doomgeneric
-set(DOOMGENERIC_DIR ${CMAKE_SOURCE_DIR}/doomgeneric)
-
-file(GLOB DOOM_SOURCES
-    "${DOOMGENERIC_DIR}/*.c"
+# Linka le librerie necessarie (Vita2D e le API di base della Vita)
+target_link_libraries(chexquest2_vita
+    vita2d
+    SceDisplay_stub
+    SceGxm_stub
+    SceCtrl_stub
+    SceRtc_stub
+    SceSysmodule_stub
+    SceCommonDialog_stub
+    ScePgf_stub
+    png
+    jpeg
+    z
+    m
+    c
 )
 
-# Rimuovi altri backend
-list(FILTER DOOM_SOURCES EXCLUDE REGEX ".*doomgeneric_sdl\\.c$")
-list(FILTER DOOM_SOURCES EXCLUDE REGEX ".*doomgeneric_win\\.c$")
-list(
+# Genera l'eseguibile e il VPK
+vita_create_self(chexquest2.self chexquest2_vita)
+vita_create_vpk(ChexQuest2.vpk "CHEX00002" chexquest2.self
+    NAME "Chex Quest 2"
+)
