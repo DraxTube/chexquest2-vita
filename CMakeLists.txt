@@ -10,45 +10,41 @@ if(NOT DEFINED ENV{VITASDK})
 endif()
 
 if(NOT DEFINED ENV{VITASDK})
-    message(FATAL_ERROR
-        "VITASDK non trovato. Installa VitaSDK e imposta la variabile d'ambiente VITASDK.")
+    message(FATAL_ERROR "VITASDK non trovato.")
 endif()
 
-# Verifica che il compilatore esista davvero
-if(NOT EXISTS "$ENV{VITASDK}/bin/arm-vita-eabi-gcc")
-    message(FATAL_ERROR
-        "arm-vita-eabi-gcc non trovato in $ENV{VITASDK}/bin/\n"
-        "Il toolchain VitaSDK non e' installato completamente.\n"
-        "Esegui: git clone https://github.com/vitasdk/vdpm && cd vdpm && ./bootstrap-vitasdk.sh")
-endif()
-
-# Usa vita.cmake come toolchain file (PRIMA di project())
+# Toolchain file PRIMA di project()
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.cmake"
-        CACHE PATH "Vita toolchain file")
+        CACHE PATH "Vita toolchain" FORCE)
 endif()
 
 project(ChexQuest2Vita C)
 
-# --- Fetch doomgeneric ---
+# --- Fetch doomgeneric (URL CORRETTO) ---
 include(FetchContent)
 FetchContent_Declare(
     doomgeneric
-    GIT_REPOSITORY https://github.com/Doom-Generic/Doom-Generic.git
+    GIT_REPOSITORY https://github.com/ozkl/doomgeneric.git
     GIT_TAG        master
+    GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(doomgeneric)
-set(DOOMGENERIC_DIR ${doomgeneric_SOURCE_DIR})
+set(DOOMGENERIC_DIR ${doomgeneric_SOURCE_DIR}/doomgeneric)
 
 # --- Flags ---
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -ffast-math")
 add_definitions(-DDOOMGENERIC -D__VITA__)
 
 # --- Sorgenti Doom ---
-file(GLOB DOOM_SRCS "${DOOMGENERIC_DIR}/doom/*.c")
-list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/doom/i_main.c")
-list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/doom/doomgeneric_sdl.c")
-list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/doom/doomgeneric_win.c")
+file(GLOB DOOM_SRCS "${DOOMGENERIC_DIR}/*.c")
+list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/i_main.c")
+list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/doomgeneric_sdl.c")
+list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/doomgeneric_win.c")
+list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/doomgeneric_xlib.c")
+list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/doomgeneric_ascii.c")
+list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/doomgeneric_null.c")
+list(REMOVE_ITEM DOOM_SRCS "${DOOMGENERIC_DIR}/doomgeneric_soso.c")
 
 # --- Target ---
 add_executable(chexquest2_vita
@@ -57,7 +53,7 @@ add_executable(chexquest2_vita
 )
 
 target_include_directories(chexquest2_vita PRIVATE
-    ${DOOMGENERIC_DIR}/doom
+    ${DOOMGENERIC_DIR}
 )
 
 target_link_libraries(chexquest2_vita
