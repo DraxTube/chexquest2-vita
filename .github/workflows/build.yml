@@ -33,13 +33,15 @@ jobs:
 
       - name: Verify toolchain
         run: |
+          echo "VITASDK=$VITASDK"
           which arm-vita-eabi-gcc
           arm-vita-eabi-gcc --version
+          ls $VITASDK/share/vita.cmake
 
       - name: Build
         run: |
-          mkdir build && cd build
-          cmake ..
+          mkdir -p build && cd build
+          cmake -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.cmake ..
           make -j$(nproc)
 
       - name: Upload VPK
