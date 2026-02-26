@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.10)
 project(ChexQuest2Vita)
 
+# Build command:
+# export VITASDK=/usr/local/vitasdk
+# mkdir build && cd build
+# cmake .. -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.cmake
+# make
+
 include(FetchContent)
 
 FetchContent_Declare(
