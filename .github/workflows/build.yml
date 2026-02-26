@@ -18,21 +18,28 @@ jobs:
       with:
         submodules: recursive
 
-    # Installa ImageMagick usando apk (gestore pacchetti di Alpine Linux)
+    # 1. Ripristina il PATH del compilatore VitaSDK
+    - name: Setup VitaSDK PATH
+      run: echo "$VITASDK/bin" >> $GITHUB_PATH
+
+    # 2. Installa ImageMagick per generare l'icona del VPK
     - name: Install dependencies
       run: apk add --no-cache imagemagick
 
+    # 3. Configura il progetto CMake
     - name: Configure CMake
       run: |
         mkdir build
         cd build
         cmake -DCMAKE_TOOLCHAIN_FILE=${VITASDK}/share/vita.cmake ..
 
+    # 4. Compila il VPK
     - name: Build VPK
       run: |
         cd build
         make -j4
 
+    # 5. Carica il file VPK compilato negli Artifacts
     - name: Upload VPK Artifact
       uses: actions/upload-artifact@v4
       with:
