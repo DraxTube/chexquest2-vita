@@ -2,7 +2,7 @@ name: Build PS Vita VPK
 
 on:
   push:
-    branches:[ "main", "master" ]
+    branches: [ "main", "master" ]
   pull_request:
     branches: [ "main", "master" ]
 
@@ -17,6 +17,10 @@ jobs:
       uses: actions/checkout@v4
       with:
         submodules: recursive
+
+    # Installa ImageMagick usando apk (gestore pacchetti di Alpine Linux)
+    - name: Install dependencies
+      run: apk add --no-cache imagemagick
 
     - name: Configure CMake
       run: |
