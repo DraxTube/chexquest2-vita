@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-# Detect VITASDK if not set
+# Force vitasdk toolchain
 if(NOT DEFINED ENV{VITASDK})
     if(EXISTS /usr/local/vitasdk)
         set(ENV{VITASDK} /usr/local/vitasdk)
@@ -9,6 +9,16 @@ if(NOT DEFINED ENV{VITASDK})
 endif()
 # Load Vita toolchain BEFORE project()
 include($ENV{VITASDK}/share/vita.cmake)
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+set(VITA TRUE)
+set(CMAKE_C_COMPILER $ENV{VITASDK}/bin/vita-clang)
+set(CMAKE_CXX_COMPILER $ENV{VITASDK}/bin/vita-clang++)
+set(CMAKE_FIND_ROOT_PATH $ENV{VITASDK}/arm-vita-eabi)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 project(ChexQuest2Vita)
 include(FetchContent)
 FetchContent_Declare(
